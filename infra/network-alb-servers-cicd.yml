@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+# This template creates the infrastructure for a VPC with public and private subnets, an internet-facing ALB, an ASG, and a CodePipeline for CI/CD. Outputs the ALB DNS Name.
+
+Parameters:
+  InstanceType:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /server-project/dev/ec2/instance-type
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /server-project/dev/ec2/custom-ami-id
+  BranchName:
+    Description: CodeCommit branch
+    Type: String
+    Default: main
+  RepositoryName:
+    Description: CodeComit repository
+    Type: String
+    Default: express-app
+
+Resources:
+  # non-default VPC Network
+  mySecureVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: "true"
+      EnableDnsSupport: "true"
+      InstanceTenancy: default
+
+  myPublicSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref mySecureVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: "true"
+
+  myPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref mySecureVPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: "true"
+
+  myInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  myAttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref mySecureVPC
+      InternetGatewayId: !Ref myInternetGateway
+
+  myPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref mySecureVPC
+
+  myInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: myAttachInternetGateway
+    Properties:
+      RouteTableId: !Ref myPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref myInternetGateway
+
+  mySubnetRouteTableAssociation0:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref myPublicRouteTable
+      SubnetId: !Ref myPublicSubnet0
+
+  mySubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref myPublicRouteTable
+      SubnetId: !Ref myPublicSubnet1
+
+  myPrivateSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.16.0/20
+      VpcId: !Ref mySecureVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  myPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.32.0/20
+      VpcId: !Ref mySecureVPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  myEIP0:
+    Type: AWS::EC2::EIP
+    DependsOn: myAttachInternetGateway
+    Properties:
+      Domain: !Ref mySecureVPC
+
+  myEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: myAttachInternetGateway
+    Properties:
+      Domain: !Ref mySecureVPC
+
+  myNATGatewaySubnet0:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref myPublicSubnet0
+      AllocationId: !GetAtt myEIP0.AllocationId
+
+  myNATGatewaySubnet1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref myPublicSubnet1
+      AllocationId: !GetAtt myEIP1.AllocationId
+
+  myPrivateRouteTableSubnet0:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref mySecureVPC
+
+  myPrivateRouteTableSubnet1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref mySecureVPC
+
+  myPrivateRTASubnet0:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref myPrivateRouteTableSubnet0
+      SubnetId: !Ref myPrivateSubnet0
+
+  myPrivateRTASubnet1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref myPrivateRouteTableSubnet1
+      SubnetId: !Ref myPrivateSubnet1
+
+  myPrivateRouteSubnet0:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref myPrivateRouteTableSubnet0
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref myNATGatewaySubnet0
+
+  myPrivateRouteSubnet1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref myPrivateRouteTableSubnet1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref myNATGatewaySubnet1
+
+  ### ELB + ASG + CodeDeployable EC2s
+
+  myInternetALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow HTTP traffic to internet-facing ALB
+      VpcId: !Ref mySecureVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+  myInternetALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref myPublicSubnet0
+        - !Ref myPublicSubnet1
+      SecurityGroups:
+        - !GetAtt myInternetALBSecurityGroup.GroupId
+
+  myHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref myTG
+      LoadBalancerArn: !Ref myInternetALB
+      Protocol: HTTP
+      Port: 8080
+
+  myTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref mySecureVPC
+      TargetType: instance
+      Protocol: HTTP
+      Port: 8080
+
+  myTargetWebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref mySecureVPC
+      GroupDescription: Allow instance traffic with ALB group only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !GetAtt myInternetALBSecurityGroup.GroupId
+
+  myInstanceDeploymentDestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  myInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref myInstanceDeploymentDestinationRole
+
+  myInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: launch-template-web-server
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt myInstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt myTargetWebServerSecurityGroup.GroupId
+
+  myASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: "2"
+      MinSize: "2"
+      MaxSize: "2"
+      HealthCheckType: ELB
+      TargetGroupARNs:
+        - !Ref myTG
+      VPCZoneIdentifier:
+        - !Ref myPrivateSubnet0
+        - !Ref myPrivateSubnet1
+      DefaultInstanceWarmup: 0
+      HealthCheckGracePeriod: 0
+      LaunchTemplate:
+        LaunchTemplateId: !Ref myInstanceLaunchTemplate
+        Version: !GetAtt myInstanceLaunchTemplate.LatestVersionNumber
+
+  ### CICD / CodeDeploy to ASG
+
+  myS3ForCodePipelineArtifacts:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: mycodepipeline-storable
+
+  myBuildProjectNodeJSApp:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt myDeploymentRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+      Artifacts:
+        Type: CODEPIPELINE
+
+  myCodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ComputePlatform: Server
+
+  myDevCodeDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      DeploymentGroupName: DeploymentGroupDevInstances
+      ApplicationName: !Ref myCodeDeployApplication
+      ServiceRoleArn: !GetAtt myDeploymentRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      AutoScalingGroups:
+        - !Ref myASG
+
+  myAppPipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      Name: codecommit-events-pipeline
+      RoleArn: !GetAtt myDeploymentRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              InputArtifacts: []
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: "1"
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: Source
+              Configuration:
+                BranchName: !Ref BranchName
+                RepositoryName: !Ref RepositoryName
+                PollForSourceChanges: false
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              InputArtifacts:
+                - Name: Source
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: Build
+              Configuration:
+                ProjectName: !Ref myBuildProjectNodeJSApp
+              RunOrder: 1
+        - Name: DeployDev
+          Actions:
+            - Name: DeployDevAction
+              InputArtifacts:
+                - Name: Build
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref myCodeDeployApplication
+                DeploymentGroupName: !Ref myDevCodeDeploymentGroup
+              RunOrder: 1
+      ArtifactStore:
+        Type: S3
+        Location: !Ref myS3ForCodePipelineArtifacts
+
+  myDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codecommit.amazonaws.com
+                - codebuild.amazonaws.com
+                - codedeploy.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+
+  myCloudWatchEventRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: "codepipeline:StartPipelineExecution"
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${myAppPipeline}"
+
+  myCloudWatchEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}"
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${myAppPipeline}"
+          RoleArn: !GetAtt myCloudWatchEventRole.Arn
+          Id: codepipeline-myAppPipeline
+
+Outputs:
+  myInternetALBDNS:
+    Description: DNS of my internet-facing ALB
+    Value: !GetAtt myInternetALB.DNSName

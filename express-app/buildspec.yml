@@ -1,0 +1,24 @@
+# AWS CodeBuild buildspec file
+
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: latest
+  pre_build:
+    commands:
+      - npm install
+  build:
+    commands:
+      # test word Hello exists in file
+      # - grep -Fq "Hello" app.js
+      - npm run build
+artifacts:
+  files:
+    - start_server.sh
+    - stop_server.sh
+    - app.js
+    - package.json
+    - appspec.yml
+    - "node_modules/**/*"
