@@ -1,4 +1,4 @@
-### Server-based architecture in AWS
+### IaC Server-based architecture in AWS Demo
 
 This is a demo of IaC and CICD pipeline with a server-based architecture in a non-default VPC.
 
